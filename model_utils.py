@@ -2,8 +2,40 @@
 
 import torch
 from torch.optim import Adam
+from torch.utils.tensorboard import SummaryWriter
 from render import *
 from ray_utils import *
+from datetime import datetime
+import glob
+import time
+
+def get_latest_model_file(models_path):
+  model_files = glob.glob("{}/*".format(models_path))
+  most_recent_file = None
+  most_recent_time, highest_epoch = None, 0
+  for model_file in model_files:
+    _, timestamp, epoch = model_file.split('_')
+    timestamp = datetime.strptime(timestamp, "%Y%m%d-%H%M%S")
+    epoch = int(epoch)
+
+    if most_recent_time is None or \
+       timestamp > most_recent_time or \
+       (timestamp == most_recent_time and epoch > highest_epoch):
+      most_recent_file = model_file
+
+  return most_recent_file
+
+def get_image_data(img_idx, images, poses, focal, near=2, far=6):
+  H,W = images.shape[1:3]
+  ray_dirs, ray_origs, _ = gen_img_rays(H, W, focal, poses[img_idx, :, :])
+  print("ray_dirs = {}, ray_origs = {}".format(ray_dirs[:3, :], ray_origs[:3, :]))
+  img = images[img_idx, :, :, :].reshape(-1,3)
+  print("img = {}".format(img[:3, :]))
+  near_far = torch.asarray([near, far])
+  near_far = torch.broadcast_to(near_far, (ray_dirs.shape[0], near_far.shape[0]))
+  image_data = torch.concatenate([ray_origs, ray_dirs, near_far, img], dim=-1)
+  print("image_data = {}".format(image_data[:3, :]))
+  return image_data
 
 def get_RGB_point_from_ray(model, batch_entry, N_points):
   # each row contains [ray_o <x,y,z>, ray_d <x,y,z>, near, far, pixel_color <r,g,b,a>]
@@ -14,9 +46,9 @@ def get_RGB_point_from_ray(model, batch_entry, N_points):
   # append the normalized direction to the pts entries
   viewdir = ray_d / np.linalg.norm(ray_d)
   viewdir = np.broadcast_to(viewdir, (pts.shape[0], viewdir.shape[0]))
-#  print("viewdir shape is {}".format(viewdir.shape))
+  print("viewdir shape is {}".format(viewdir.shape))
   train_in = torch.from_numpy(np.concatenate([pts, viewdir], axis=-1))
-#  print("train_in shape is {}".format(train_in.shape))
+  print("train_in shape is {}".format(train_in.shape))
   # get rgb and volume density value for the given ray using the pts and the viewdir
   # 
   rgb_vol_vals = model(train_in)
@@ -26,44 +58,38 @@ def get_RGB_point_from_ray(model, batch_entry, N_points):
   
   return rgb
   
-def get_RGB_points_from_batch(model, batch_data, N_points):
+def get_RGB_points_from_batch(model, batch_data, N_points, pos_enc):
   # each row contains [ray_o <x,y,z>, ray_d <x,y,z>, near, far, pixel_color <r,g,b,a>]
   # each entry is ray_orig, ray_dir -> need to calculate pts for each ray
+  if torch.cuda.is_available():
+    torch.set_default_tensor_type('torch.cuda.FloatTensor')
+
   ray_o, ray_d = batch_data[..., 0:3], batch_data[..., 3:6]
-  near, far = batch_data[..., 6], batch_data[..., 7]
-  batch_pts, z_vals = None, None
-  for row in range(batch_data.shape[0]):
-    pts, zvals = gen_ray_pts(ray_o[row], ray_d[row], near[row], far[row], N_points)
-    # append the normalized direction to the pts entries
-    viewdir = ray_d[row] / np.linalg.norm(ray_d[row])
-    viewdir = np.broadcast_to(viewdir, (pts.shape[0], viewdir.shape[0]))
- #   print("viewdir shape is {}".format(viewdir.shape))
-    train_in = torch.from_numpy(np.concatenate([pts, viewdir], axis=-1))
-    zvals = torch.from_numpy(zvals)
- #   print("train_in shape is {}".format(train_in.shape))
-    if batch_pts is None:
-      batch_pts = train_in
-    else:
-      batch_pts = torch.vstack([batch_pts, train_in])
-      
-    if z_vals is None:
-      z_vals = zvals
-    else:
-      z_vals = torch.vstack([z_vals, zvals])
-  
-  batch_pts = torch.reshape(batch_pts, (batch_data.shape[0], N_points, batch_pts.shape[-1]))
+  near, far = batch_data[..., 6:7], batch_data[..., 7:8]
+  pts, z_vals = gen_pts_from_rays_batch(ray_o, ray_d, near, far, N_points)
+  # add the view dir
+  # first need to reshape ray_d since the pts in the last 2 dimensions are from ONE RAY
+  view_dir = ray_d / torch.norm(ray_d, dim=-1).reshape(ray_d.shape[0], 1)
+  view_dir = view_dir.reshape(view_dir.shape[0], 1, view_dir.shape[-1])
+  # plus need to project this viewdir along the rows dimension
+  view_dir = torch.broadcast_to(view_dir, (view_dir.shape[0], pts.shape[-2], view_dir.shape[-1]))
+
+ # batch_pts = np.concatenate([pts, view_dir], axis=-1)
+  batch_pts = calculate_batch_positive_encoding(pts, pos_enc)
+  batch_pts = torch.cat((batch_pts, view_dir), dim=-1)
   print("batch_pts shape is {}".format(batch_pts.shape))
   # get rgb and volume density value for the given ray using the pts and the viewdir
-  # 
-  batch_rgb_vol_vals = model(batch_pts)
-  model_output = None
-  for entry in range(batch_rgb_vol_vals.shape[0]):
-    # get the rgb of that ray using classical volumetric rendering
-    rgb = volumetric_render(batch_rgb_vol_vals[entry,:,:], z_vals[entry], ray_d[entry])
-    if model_output is None:
-      model_output = rgb
-    else:
-      model_output = torch.vstack([model_output, rgb])
+  #
+#  batch_pts_flat = torch.from_numpy(batch_pts)
+  batch_pts_flat = batch_pts
+  batch_pts_flat = torch.reshape(batch_pts_flat, [-1,batch_pts_flat.shape[-1]])
+  #batch_pts_flat = batch_pts_flat.to(torch.double)
+  batch_pts_flat = batch_pts_flat.to('cuda')
+  start = time.time()
+  batch_rgb_vol_vals = model(batch_pts_flat)
+  batch_rgb_vol_vals = torch.reshape(batch_rgb_vol_vals, list(batch_pts.shape[:-1]) + [batch_rgb_vol_vals.shape[-1]])
+  print("Elapsed time of model calc is {}".format(time.time() - start))
+  model_output = batch_volumetric_render(batch_rgb_vol_vals, z_vals, ray_d)
       
   return model_output 
   
@@ -72,7 +98,7 @@ def train_batch_entry_separately(model, batch_data, N_points):
   for batch_entry in batch_data:
     # get the rgb of that ray using classical volumetric rendering
     rgb = get_RGB_point_from_ray(model, batch_entry, N_points)
-  #  print("rgb is {}".format(rgb))
+    print("rgb is {}".format(rgb))
     # add this rgb value (of the ray) to model output so we can calculate loss
     if model_output is None:
       model_output = rgb
@@ -81,43 +107,72 @@ def train_batch_entry_separately(model, batch_data, N_points):
       
   return model_output
   
-def train(epochs, model, training_data, batch_size, N_points):
+def train(epoch, model, training_data, batch_size, N_points, pos_enc=6):
   # keep track of best accuracy - if model more accurate than best accuracy save params of that model
   best_accuracy = 0.0
-  
-  # TODO parametrize the optimizer
-  loss_function = torch.nn.MSELoss()
-  optimizer = Adam(model.parameters(), lr=0.001, weight_decay=0.0001)
-  
-  # define execution device
-  device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-  # convert model params and buffers to CPU or Cuda
-  model.to(device)
   model.train(True)
+  model.cuda()
+  # TODO parametrize the optimizer
+  def loss_function(output, target):
+    loss = torch.mean(torch.square(output - target))
+    return loss
+#  loss_function = nn.MSELoss()
   
-  for epoch in range(epochs):
-    batch_start = 0 
-    while batch_start < training_data.shape[0]:
-      batch_data = training_data[batch_start:batch_start + batch_size, :]
- #     model_output = train_batch_entry_separately(model, batch_data, N_points)
-      model_output = get_RGB_points_from_batch(model, batch_data, N_points)
-      
-      # get the expected output of the batch - just drop the 'a' in rgba for now
-      expected_output = torch.from_numpy(batch_data[:, -4:-1])
-   #   print("expected_output is {}".format(expected_output))
-   #   print("expected_output shape is {}".format(expected_output.shape))
-   #   print("model_output is {}".format(model_output))
-   #   print("model_output shape is {}".format(model_output.shape))
-      # zero the parameter gradients
-      optimizer.zero_grad()
-      
-      # calculate loss based on model_output vs expected_output
-      loss = loss_function(model_output, expected_output)
-      # do backprop on the loss
-      loss.backward()      
-      # adjust parameters based on calculated gradients
-      optimizer.step()
-      
-      print("loss item is {}".format(loss.item()))
+  optimizer = Adam(model.parameters(), lr=5e-4)
+  for param in optimizer.state.values():
+    param.data = param.data.to('cuda')
+    param._grad.data = param._grad.data.to('cuda')
+  
+  # add summary writer
+  train_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+  writer = SummaryWriter('runs/NeRF_trainer_{}'.format(train_timestamp))
+  #training_data = torch.tensor(training_data, device='cuda')
 
-      batch_start = batch_start + batch_size + 1
+  batch_start, batch_count = 0, 0
+  batch_len = training_data.shape[0] / batch_size
+  if training_data.shape[0] % batch_size > 0:
+    batch_len += 1
+  
+  model_output = torch.Tensor(device='cuda')
+
+  while batch_start < training_data.shape[0]:
+    print("batch number {}".format(batch_count))
+    batch_data = training_data[batch_start:batch_start + batch_size, :]
+    batch_data = batch_data.to('cuda')
+
+    model_batch_output = get_RGB_points_from_batch(model, batch_data, N_points, pos_enc)
+    model_output = torch.concat([model_output, model_batch_output])
+    #model_output = model_batch_output
+    print("model_batch_output shape {}".format(model_batch_output.shape))
+    print("model output nonzero values {}".format(torch.nonzero(model_output)))
+    batch_start = batch_start + batch_size
+    batch_count += 1
+
+ # model_output = model_output.to(torch.double)
+  expected_output = training_data[:, -3:]
+#  expected_output = expected_output.to(torch.double)
+  expected_output = expected_output.to('cuda')
+  print("expected_output is {}".format(expected_output))
+  print("expected_output shape is {}".format(expected_output.shape))
+  print("model_output is {}".format(model_output))
+  print("model_output shape is {}".format(model_output.shape))
+      
+  # zero the parameter gradients
+  optimizer.zero_grad()
+      
+  # calculate loss based on model_output vs expected_output
+  loss = loss_function(model_output, expected_output)
+  # do backprop on the loss
+  loss.backward()      
+  # adjust parameters based on calculated gradients
+  optimizer.step()
+
+  print("loss is {}".format(loss))
+ # writer.add_scalar("loss/train", loss, epoch)
+
+  epoch_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+ # writer.add_scalars('Training loss',
+ #                       {'Training': loss}, epoch)
+ # writer.flush()
+  #model_path = "models/model_{}_{}".format(epoch_timestamp, epoch)
+ # torch.save(model.state_dict(), model_path)
