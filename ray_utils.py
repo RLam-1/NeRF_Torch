@@ -20,6 +20,7 @@ def gen_img_rays(H, W, f, cam_2_world):
   
   # The ray dirs are in row order [(0,0,1) -> (W,0,1), (0,1,1) -> (W,1,1)]
   raydirs = torch.stack(((i-cx)/f, -(j-cy)/f, -torch.ones_like(i)), -1)
+  print(raydirs.is_cuda)
   pixelDict = torch.stack((i, j), -1)
   
   # multiply the cam_2_world rotation matrix to get the direction of the ray
@@ -62,12 +63,14 @@ def gen_pts_from_rays_batch(ray_orig, ray_dir, near, far, N_points):
   #ray_dir = torch.from_numpy(ray_dir.reshape(ray_dir.shape[0], 1, ray_dir.shape[-1]))
   ray_dir = ray_dir.reshape(ray_dir.shape[0], 1, ray_dir.shape[-1])
   #ray_dir = ray_dir.to('cuda')
- # t_vals = np.linspace(0., 1., N_points)
   t_vals = torch.linspace(0., 1., N_points)
   # let's do sample linearly in inverse depth (disparity)
   z_vals = near * (1. - t_vals) + far * (t_vals)
+  z_vals_t = z_vals[..., :, None]
+  z_vals_t += torch.rand(z_vals_t.shape) * (far[0][0]-near[0][0])/N_points
+  print("z_vals_t shape is {}".format(z_vals_t.shape))
  # z_vals_tensor = torch.from_numpy(z_vals[..., :, None])
  # z_vals_tensor = z_vals_tensor.to('cuda')
-  pts = ray_orig + ray_dir * z_vals[..., :, None]
+  pts = ray_orig + ray_dir * z_vals_t
   # return the zvals in their original 1 by N dimension because the zvals are just from 1 sample ray and each entry has only 1 dimension
   return pts, z_vals

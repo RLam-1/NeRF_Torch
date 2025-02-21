@@ -49,7 +49,7 @@ def volumetric_render(rgb_vol, zvals, ray_dir):
   return rgb
 
 # This API calculates the final rgb from the rgb_vol_density readings along a ray
-def batch_volumetric_render(rgb_vol, zvals, rays_dir):
+def batch_volumetric_render(rgb_vol, zvals, rays_dir, training=True):
   # first calculate the distances between the zvals of the points along the ray
   dists = zvals[..., 1:] - zvals[..., :-1]
   # need to add infinite for the distance of the last point
@@ -67,6 +67,7 @@ def batch_volumetric_render(rgb_vol, zvals, rays_dir):
   # before the shape of the dists is horiz(dists along ray), vert(rays in batch)
   #    now the shape of the dists is z(rays in batch) y(dists along ray)
   dists = dists.reshape(dists.shape[0], dists.shape[1], 1)
+  dists = dists.to('cuda')
   #dists = torch.Tensor(dists, device='cuda')
   print("dists is {}".format(dists))
   print("dists nonzero {}".format(dists))
@@ -80,10 +81,18 @@ def batch_volumetric_render(rgb_vol, zvals, rays_dir):
   #  NOTE: the sigma is the 4th entry of rgb_vol
   #   Since alpha is strictly between 0 and 1 -> need to apply ReLU to the sigma
   # take the last column of each rgb_vol entry -> this is the volumetric density
-  if torch.any(torch.relu(rgb_vol[..., 3:4])) == True:
-    density = rgb_vol[..., 3:4]
+  #if torch.any(torch.relu(rgb_vol[..., 3:4])) == True:
+  #  density = rgb_vol[..., 3:4]
+  #else:
+  #  density = torch.sigmoid(rgb_vol[..., 3:4])
+  #density = torch.abs(rgb_vol[...,3:4])
+  if training:
+    raw_noise_std = 1e0
   else:
-    density = torch.sigmoid(rgb_vol[..., 3:4])
+    raw_noise_std = 0
+  density_noise = torch.rand(rgb_vol[..., 3:4].shape) * raw_noise_std
+  density_noise = density_noise.to('cuda')
+  density = rgb_vol[..., 3:4] + density_noise
   alpha = 1.0 - torch.exp(-(torch.relu(density)) * dists)
   print("relu rgb_vol {}".format(torch.relu(rgb_vol[...,3:4])))
   print("dists {}".format(dists))
@@ -96,7 +105,7 @@ def batch_volumetric_render(rgb_vol, zvals, rays_dir):
   # NOTE that the rolling product ends at j-1 meaning that the first entry is 1
   # and the last element is removed
   cumprod = cumprod[:,:-1,:]
-  firstelem = torch.ones((cumprod.shape[0],1,1), dtype=torch.float64)
+  firstelem = torch.ones((cumprod.shape[0],1,1), dtype=torch.float64).to('cuda')
   cumprod = torch.cat([firstelem, cumprod], axis=1)  
   print("cumprod is {}".format(cumprod))
   weights = alpha * cumprod
