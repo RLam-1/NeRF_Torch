@@ -16,7 +16,7 @@ def validate_blender_data(rootDir, val_model, imgScale, near, far, pos_enc, view
   imgObjects = load_val_blender(rootDir, near, far, imgScale)
   img_idx = np.random.randint(len(imgObjects))
 
-  validate_data = imgObjects[img_idx].genModelData()
+  validate_data, _ = imgObjects[img_idx].genModelData()
 
   def loss_function(output, target):
     loss = torch.mean(torch.square(output - target))
@@ -25,15 +25,33 @@ def validate_blender_data(rootDir, val_model, imgScale, near, far, pos_enc, view
   val_model.eval()
   val_model.cuda()
 
+  avg_loss = 0.0
+
   with torch.no_grad():
-    v_output = model_utils.get_RGB_points_from_batch(val_model, validate_data, N_points, pos_enc, view_dir, view_enc, training=False)
-    expected_output = validate_data[:, -3:]
-    v_loss = loss_function(v_output, expected_output)
-    print("validate loss is {}".format(v_loss))
+    batch_start, batch_count = 0, 0
+    # from empirical data - was able to fit 1024 * 5 input points onto 8GB VRAM GPU
+    batch_size = 1024 * 5
+    v_output = torch.Tensor(device='cuda')
+    while batch_start < validate_data.shape[0]:
+      v_batch_data = validate_data[batch_start:batch_start + batch_size, :]
+      v_batch_output = model_utils.get_RGB_points_from_batch(val_model, v_batch_data, N_points, pos_enc, view_dir, view_enc, training=False)
+      expected_batch_output = validate_data[batch_start:batch_start + batch_size, -3:]
+      v_batch_loss = loss_function(v_batch_output, expected_batch_output)
+      print("validate loss is {}".format(v_batch_loss))
+      avg_loss += v_batch_loss.item()
+      v_output = torch.concat([v_output, v_batch_output])
+
+      batch_start += batch_size
+      batch_count += 1
+
+  avg_loss /= batch_count
+  print("near = {}, far = {}".format(near, far))
 
   # reshape the expected output and model output so that it takes on image shape
-  v_output_img = torch.reshape(v_output, list(images.shape[1:])).cpu()
-  expected_output_img = torch.reshape(expected_output, list(images.shape[1:])).cpu()
+  img_shape = list(imgObjects[img_idx].getImgRGB().shape)
+  v_output_img = torch.reshape(v_output, img_shape).cpu()
+  #expected_output_img_from_structure = torch.reshape(validate_data[:, -3:], img_shape).cpu()
+  expected_output_img = imgObjects[img_idx].image.cpu()
   print(torch.nonzero(v_output_img))
 
   plt.figure(figsize=(10,4))

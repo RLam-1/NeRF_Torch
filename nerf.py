@@ -25,6 +25,17 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.set_default_device(device)
 
+# API to return the near / far value
+# empirical data shows that:
+# image size H, W = 800, 800 - near = 0, far = 1
+# image size H, W = 100, 100 - near = 2, far = 6
+# Assume linear relationship between H,W and near/far
+def getNearFar(imgScale):
+  #imgWidth = 800. / imgScale
+  near = 2
+  far = 6
+  return near, far
+
 # TODO - also parametrize the model as well
 # API to load the saved model file given the parameters of the input to test such as:
 # - model file name (if given)
@@ -90,16 +101,25 @@ def train_blender_data(model_file, imgScale, epochs, near, far, pos_enc, view_di
   
   train_model = defaultNet(input_dir_dim=(3 if view_dir else 0), pos_enc=pos_enc)
   if model_file:
-    train_model.load_state_dict(torch.load(model_file, weights_only=True)) 
+    train_model.load_state_dict(torch.load(model_file, weights_only=True))
+
+  # first mode - randomize over ALL rays from ALL images
+ # total_train_data = torch.Tensor(device='cuda')
+ # for i in range(len(trainImgObjs)):
+ #   total_train_data = torch.concat([total_train_data, trainImgObjs[i].genModelData()])
+
+ # batch_size = 1024 * 5
 
   for epoch in range(epochs):
     print("epoch {}".format(epoch))
+  #  rowIdx = torch.randint(0, total_train_data.shape[0], (batch_size, ))
+  #  train_data = total_train_data[rowIdx][:]
     img_idx = np.random.randint(len(trainImgObjs))
-    train_data = trainImgObjs[img_idx].genModelData()
-    print("train_data = {}".format(train_data[:3, :]))
-    print(train_data.shape)
+    train_data, cropped_train_data = trainImgObjs[img_idx].genModelData()
 
-    loss = model_utils.train(epoch, model=train_model,
+    loss = model_utils.train_img(epoch, epochs,
+                            model=train_model,
+                            cropped_training_data=cropped_train_data,
                              training_data=train_data,
                              batch_size=1024*5,
                              N_points=N_pts,
@@ -107,11 +127,22 @@ def train_blender_data(model_file, imgScale, epochs, near, far, pos_enc, view_di
                              view_dir=view_dir,
                              view_enc=view_enc)
     
+  #  loss = model_utils.train_batch(epoch, epochs,
+  #                          model=train_model,
+  #                           training_data=train_data,
+  #                           cropped_training_data=cropped_train_data,
+  #                           batch_size=1024*5,
+  #                           N_points=N_pts,
+  #                           pos_enc=pos_enc,
+  #                           view_dir=view_dir,
+  #                           view_enc=view_enc)
+    
     if (epoch % 100 == 99 and epoch > 0) or \
        epoch == epochs - 1:
       epoch_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
       model_file_name = os.path.join(models_dir, "model_{}_{}".format(epoch_timestamp, epoch))
-      mdata_entry = {'model_file': model_file_name, 'loss': loss.item(), 'epoch': epoch}
+      #mdata_entry = {'model_file': model_file_name, 'loss': loss.item(), 'epoch': epoch}
+      mdata_entry = {'model_file': model_file_name, 'loss': loss, 'epoch': epoch}
       mdata_entry.update(model_mdata)
       update_mdata_file(mdata_entry)
       torch.save(train_model.state_dict(), model_file_name)
@@ -194,11 +225,30 @@ def video_tiny_nerf_data(model_file_name):
 
   generate_video(video_model, H, W, focal, 2., 6., N_pts, pos_enc, view_dir, view_enc)
 
+def video_blender_data(model_file_name, imgScale):
+  H, W = int(800. // imgScale), int(800. // imgScale)
+
+  valJSONFile = os.path.join(fileDir, "nerf_synthetic/lego/transforms_val.json")
+  with open(valJSONFile) as jsFile:
+    valJSON = json.load(jsFile)
+    focal = W * 0.5 / np.tan(float(valJSON["camera_angle_x"]) * 0.5)
+
+  model_file = os.path.join(models_dir, model_file_name)
+  pos_enc, view_dir, view_enc, N_pts = get_model_params(model_file)
+  print("{}. {}, {}, {}".format(pos_enc, view_dir, view_enc, N_pts))
+  video_model = defaultNet(input_dir_dim=(3 if view_dir else 0), pos_enc=pos_enc)
+  video_model.load_state_dict(torch.load(model_file, weights_only=True))
+  
+  generate_video(video_model, H, W, focal, 2., 6., N_pts, pos_enc, view_dir, view_enc)
+
 def main():
   if torch.cuda.is_available():
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
   args = get_opts()
-  if len(args.validate) > 0 and os.path.isfile(os.path.join(models_dir, args.validate)):
+  if len(args.validate) > 0:
+    if not os.path.isfile(os.path.join(models_dir, args.validate)):
+      print("{} not found".format(args.validate))
+      return
     validate_model = defaultNet()
     validate_model_file = os.path.join(models_dir, args.validate)
     print("loading model parameters from file {}".format(validate_model_file))
@@ -208,16 +258,27 @@ def main():
     if pos_enc is None or view_dir is None or view_enc is None or N_pts is None:
       print("ERROR - missing model parameters in model metadata file for model file {}".format(args.validate))
       return
-    validate_utils.validate_tiny_nerf_data(validate_model, 
-                                           near=args.near, far=args.far,
-                                           pos_enc=pos_enc, 
-                                           view_dir=view_dir, 
-                                           view_enc=view_enc,
-                                           N_points=N_pts)
+   # validate_utils.validate_tiny_nerf_data(validate_model, 
+   #                                        near=args.near, far=args.far,
+   #                                        pos_enc=pos_enc, 
+   #                                        view_dir=view_dir, 
+   #                                        view_enc=view_enc,
+   #                                        N_points=N_pts)
+    near, far = getNearFar(args.imgScale)
+    validate_utils.validate_blender_data(rootDir=fileDir,
+                                         val_model=validate_model,
+                                         imgScale=args.imgScale,
+                                         near=near,
+                                         far=far,
+                                         pos_enc=pos_enc,
+                                         view_dir=view_dir,
+                                         view_enc=view_enc,
+                                         N_points=N_pts)
   elif len(args.interactive) and os.path.isfile(os.path.join(models_dir, args.interactive)):
     interactive_tiny_nerf_data(args.interactive)
   elif len(args.video) and os.path.isfile(os.path.join(models_dir, args.video)):
-    video_tiny_nerf_data(args.video)
+    #video_tiny_nerf_data(args.video)
+    video_blender_data(args.video, args.imgScale)
   else:
     viewdir_flag = not args.no_view_dir
     if len(args.load_file) and \
@@ -234,37 +295,38 @@ def main():
     else:
        model_file = None
        pos_enc, view_dir, view_enc, N_pts = args.pos_enc, viewdir_flag, args.view_enc, args.num_pts
-      
-    train_model = train_tiny_nerf_data(model_file=model_file, epochs=args.epochs,
-                                       near=args.near, far=args.far,
-                                       pos_enc=pos_enc, 
-                                       view_dir=view_dir, 
-                                       view_enc=view_enc,
-                                       N_pts=N_pts)
-   # train_model = train_blender_data(model_file=model_file,
-   #                                  imgScale=4.0,
-   #                                  epochs=args.epochs,
-   #                                  near=0.,
-   #                                  far=1.,
-   #                                  pos_enc=pos_enc,
-   #                                  view_dir=view_dir,
-   #                                  view_enc=view_enc,
-   #                                  N_pts=N_pts)
-    validate_utils.validate_tiny_nerf_data(train_model,
-                                           near=args.near, far=args.far,
-                                           pos_enc=pos_enc, 
-                                           view_dir=view_dir, 
-                                           view_enc=view_enc,
-                                           N_points=N_pts)
-    #validate_utils.validate_blender_data(rootDir=fileDir,
-    #                                     val_model=train_model,
-    #                                     imgScale=4.0,
-    #                                     near=0.,
-    #                                     far=1.,
-    #                                     pos_enc=pos_enc,
-    #                                     view_dir=view_dir,
-    #                                     view_enc=view_enc,
-    #                                     N_points=N_pts)
+
+    near, far = getNearFar(args.imgScale)
+   # train_model = train_tiny_nerf_data(model_file=model_file, epochs=args.epochs,
+   #                                    near=args.near, far=args.far,
+   #                                    pos_enc=pos_enc, 
+   #                                    view_dir=view_dir, 
+   #                                    view_enc=view_enc,
+   #                                    N_pts=N_pts)
+    train_model = train_blender_data(model_file=model_file,
+                                     imgScale=args.imgScale,
+                                     epochs=args.epochs,
+                                     near=near,
+                                     far=far,
+                                     pos_enc=pos_enc,
+                                     view_dir=view_dir,
+                                     view_enc=view_enc,
+                                     N_pts=N_pts)
+   # validate_utils.validate_tiny_nerf_data(train_model,
+   #                                        near=args.near, far=args.far,
+   #                                        pos_enc=pos_enc, 
+   #                                        view_dir=view_dir, 
+   #                                        view_enc=view_enc,
+   #                                        N_points=N_pts)
+    validate_utils.validate_blender_data(rootDir=fileDir,
+                                         val_model=train_model,
+                                         imgScale=args.imgScale,
+                                         near=near,
+                                         far=far,
+                                         pos_enc=pos_enc,
+                                         view_dir=view_dir,
+                                         view_enc=view_enc,
+                                         N_points=N_pts)
   
 if __name__ == '__main__':
   main()

@@ -114,6 +114,11 @@ def batch_volumetric_render(rgb_vol, zvals, rays_dir, training=True):
 #  print("weights is {}".format(weights))
   # now that we have the weights and the alpha for each rgb - multiply them all together and sum the vector to output a single rgb
   rgb = torch.sum(weights * rgb_vals, axis=-2)
+
+  # assume white background
+  #acc_map = torch.sum(weights, dim=-2)
+  #rgb = rgb + (1.-acc_map[..., None])
+
   print("rgb is {}".format(rgb))
   print("rgb nonzero {}".format(torch.nonzero(rgb)))
   

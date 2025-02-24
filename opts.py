@@ -26,5 +26,7 @@ def get_opts():
                       help='run interactive mode on saved model passed as input')
   parser.add_argument('--video', type=str, default='',
                       help='generate video of saved model passed as input')
+  parser.add_argument('--imgScale', type=float, default=2.0,
+                      help='factor to which to scale down the image')
   
   return parser.parse_args()

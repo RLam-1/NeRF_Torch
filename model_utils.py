@@ -27,7 +27,7 @@ def get_latest_model_file(models_path):
   return most_recent_file
 
 def get_rays_data(H, W, focal, pose, near, far):
-  ray_dirs, ray_origs, _ = gen_img_rays(H, W, focal, pose)
+  ray_dirs, ray_origs, cropped_ray_dirs, cropped_ray_origs = gen_img_rays(H, W, focal, pose)
   print("ray_dirs = {}, ray_origs = {}".format(ray_dirs[:3, :], ray_origs[:3, :]))
   near_far = torch.asarray([near, far])
   near_far = torch.broadcast_to(near_far, (ray_dirs.shape[0], near_far.shape[0]))
@@ -172,3 +172,126 @@ def train(epoch, model, training_data, batch_size, N_points, pos_enc, view_dir, 
 
   return loss
 
+def train_img(epoch, epochs, model, cropped_training_data, training_data, batch_size, N_points, pos_enc, view_dir, view_enc):
+  # keep track of best accuracy - if model more accurate than best accuracy save params of that model
+  best_accuracy = 0.0
+  model.train(True)
+  model.cuda()
+  # TODO parametrize the optimizer
+  def loss_function(output, target):
+    loss = torch.mean(torch.square(output - target))
+    return loss
+#  loss_function = nn.MSELoss()
+  avg_loss = 0.0
+  optimizer = Adam(model.parameters(), lr=5e-4)
+  
+  # add summary writer
+  train_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+  writer = SummaryWriter('runs/NeRF_trainer_{}'.format(train_timestamp))
+  #training_data = torch.tensor(training_data, device='cuda')
+
+  batch_start, batch_count = 0, 0
+  batch_len = training_data.shape[0] / batch_size
+  if training_data.shape[0] % batch_size > 0:
+    batch_len += 1
+  
+  if epoch < epochs // 4:
+    rowIdx = torch.randperm(cropped_training_data.shape[0])
+    input_data = cropped_training_data[rowIdx][:]
+  else:
+    rowIdx = torch.randperm(training_data.shape[0])
+    input_data = training_data[rowIdx][:]
+
+  # shuffle the training data
+  #rowIdx = torch.randperm(training_data.shape[0])
+  #training_data = training_data[rowIdx][:]
+
+  while batch_start < input_data.shape[0]:
+    print("batch number {}".format(batch_count))
+    batch_data = input_data[batch_start:batch_start + batch_size, :]
+    expected_batch_output = input_data[batch_start:batch_start + batch_size, -3:]
+
+    model_batch_output = get_RGB_points_from_batch(model, batch_data, N_points, pos_enc, view_dir, view_enc)
+
+    #model_output = model_batch_output
+    print("model batch output nonzero values {}".format(torch.nonzero(model_batch_output)))
+    batch_start = batch_start + batch_size
+    batch_count += 1
+
+   # model_output = model_output.to(torch.double)
+    
+  #  expected_output = expected_output.to(torch.double)
+    expected_batch_output = expected_batch_output.to('cuda')
+    print("expected_output is {}".format(expected_batch_output))
+    print("expected_output shape is {}".format(expected_batch_output.shape))
+    print("model_output is {}".format(model_batch_output))
+    print("model_output shape is {}".format(model_batch_output.shape))
+      
+    # zero the parameter gradients
+    optimizer.zero_grad()
+    # calculate loss based on model_batch_output vs expected_batch_output
+    loss = loss_function(model_batch_output, expected_batch_output)
+    # do backprop on the loss
+    loss.backward()      
+    # adjust parameters based on calculated gradients
+    optimizer.step()
+
+    print("loss is {}".format(loss))
+    avg_loss += loss.item()
+
+  avg_loss /= batch_count
+  return avg_loss
+
+def train_batch(epoch, epochs, model, cropped_training_data, training_data, batch_size, N_points, pos_enc, view_dir, view_enc):
+  # keep track of best accuracy - if model more accurate than best accuracy save params of that model
+  best_accuracy = 0.0
+  model.train(True)
+  model.cuda()
+  # TODO parametrize the optimizer
+  def loss_function(output, target):
+    loss = torch.mean(torch.square(output - target))
+    return loss
+#  loss_function = nn.MSELoss()
+  avg_loss = 0.0
+  optimizer = Adam(model.parameters(), lr=5e-4)
+  
+  # add summary writer
+  train_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+  writer = SummaryWriter('runs/NeRF_trainer_{}'.format(train_timestamp))
+  #training_data = torch.tensor(training_data, device='cuda')
+
+  if epoch < 0:
+    rowIdx = torch.randint(0, cropped_training_data.shape[0], (batch_size,))
+    input_data = cropped_training_data[rowIdx][:]
+  else:
+    rowIdx = torch.randint(0, training_data.shape[0], (batch_size,))
+    input_data = training_data[rowIdx][:]
+
+  expected_batch_output = input_data[:, -3:]
+
+  model_batch_output = get_RGB_points_from_batch(model, input_data, N_points, pos_enc, view_dir, view_enc)
+
+    #model_output = model_batch_output
+  print("model batch output nonzero values {}".format(torch.nonzero(model_batch_output)))
+
+   # model_output = model_output.to(torch.double)
+    
+  #  expected_output = expected_output.to(torch.double)
+  expected_batch_output = expected_batch_output.to('cuda')
+  print("expected_output is {}".format(expected_batch_output))
+  print("expected_output shape is {}".format(expected_batch_output.shape))
+  print("model_output is {}".format(model_batch_output))
+  print("model_output shape is {}".format(model_batch_output.shape))
+      
+  # zero the parameter gradients
+  optimizer.zero_grad()
+  # calculate loss based on model_batch_output vs expected_batch_output
+  loss = loss_function(model_batch_output, expected_batch_output)
+  # do backprop on the loss
+  loss.backward()      
+  # adjust parameters based on calculated gradients
+  optimizer.step()
+
+  print("loss is {}".format(loss))
+
+  return loss.item()
